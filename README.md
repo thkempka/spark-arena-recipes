@@ -1,0 +1,89 @@
+# spark-arena-recipes
+
+Self-contained **sparkrun** recipes for LLM inference on NVIDIA DGX Spark (GB10),
+prepared for Spark Arena submission and for anyone with a clean checkout of
+[`eugr/spark-vllm-docker`](https://github.com/eugr/spark-vllm-docker).
+
+**Goal:** clone this repo (+ `spark-vllm-docker`), run `./setup.sh`, and the
+recipes are runnable. Everything (images, models, overlays) is either
+digest-pinned and pulled from a public registry, or built offline from
+sha256-verified, vendored sources. No files outside this repo are required.
+
+---
+
+## Recipes (4)
+
+| Recipe | Model | Runtime | Topology | Port |
+|---|---|---|---|---|
+| [`qwen38-dflash2-sglang-a.yaml`](qwen38-dflash2-sglang-a.yaml) | Qwen3.8-27B NVFP4 | SGLang + DFlash2 (k=8) | 1× DGX Spark, tp=1 | 8000 |
+| [`qwen38-dflash2-sglang-parallel-a.yaml`](qwen38-dflash2-sglang-parallel-a.yaml) | Qwen3.8-27B NVFP4 | SGLang + DFlash2 (k=8) | 2× DGX Spark, tp=2 | 8000 |
+| [`deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml`](deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml) | DeepSeek-V4-Flash-0731 | vLLM + DSpark (k=5) | 2× DGX Spark, tp=2, 1M ctx | 8000 |
+| [`deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml`](deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml) | DeepSeek-V4-Flash-0731 | vLLM B12X + DSpark | 2× DGX Spark, tp=2 | 8000 |
+
+All container images are **digest-pinned** (immutable, reproducible). The two
+registry images are pulled as-is; the qwen38 image is built offline from a
+pinned public base + a vendored, sha256-verified DFlash2 overlay.
+
+---
+
+## Quick start
+
+```bash
+# prerequisites
+git clone https://github.com/eugr/spark-vllm-docker   # upstream build/laugh scripts
+git clone <this-repo> && cd <this-repo>
+pipx install sparkrun==0.3.5    # pin the tool version (recipes tuned on 0.3.5)
+
+# provision (pull/build images, validate env; idempotent)
+QWEN38_API_KEY="$(cat my-secret)" ./setup.sh
+
+# run
+QWEN38_API_KEY="$QWEN38_API_KEY" sparkrun run qwen38-dflash2-sglang-a.yaml --solo
+sparkrun run deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml --cluster <your-2node-cluster>
+sparkrun run deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml --cluster <your-2node-cluster>
+```
+
+`./setup.sh --check` reports what is present/missing without changing anything.
+
+---
+
+## Image provenance (pinned)
+
+| Image | Source | Pinned as |
+|---|---|---|
+| `qwen38-dflash2:v1.2.2` | built offline from `docker/qwen38-dflash2/` | base `lmsysorg/sglang@sha256:febfb971…` + 5 verified files |
+| DS b12x | `ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x` | `@sha256:af9629c5…` |
+| DS nvfp4-1m | `ghcr.io/bjk110/vllm-spark` | `@sha256:d8492e76…` |
+
+---
+
+## Credits & references
+
+### Base framework / tooling
+- **[eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker)** — the Docker config, launcher and build scripts (vLLM on DGX Spark, single/multi-node). Every recipe here runs on top of it. Author: eugr.
+- **[sparkrun](https://pypi.org/project/sparkrun/)** — the recipe/workload manager (CLI) used to launch all recipes. Pin `sparkrun==0.3.5` for parity.
+
+### Qwen3.8-27B NVFP4 + DFlash2 (SGLang)
+- **Model:** `RadixArk/Qwen3.8-27B-NVFP4` (HF). Qwen3.8-27B by Alibaba Qwen team; NVFP4-quantized weights by RadixArk.
+- **Drafter:** `z-lab/Qwen3.8-27B-DFlash2`, revision `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` (HF).
+- **DFlash2 code:** merged upstream in **[sgl-project/sglang PR #35371](https://github.com/sgl-project/sglang/pull/35371)** ("DFlash2: local convolution + candidate selector", 2026-08-19, commit `c14312a66420b75c`), Apache-2.0. The vendored overlay + manifest live in `docker/qwen38-dflash2/`; see [`ATTRIBUTION.md`](docker/qwen38-dflash2/ATTRIBUTION.md) for full provenance of each of the 5 files.
+- **Recipe concept & image build:** **[hasso5703/dgx-spark-qwen38](https://github.com/hasso5703/dgx-spark-qwen38)** — the original qwen38 SGLang + DFlash2 systemd deployment this recipe is ported from (base image, overlay, chat template, api-key handling).
+- **Additional upstream contributors referenced in ATTRIBUTION.md:** [MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark), [r0b0tlab/qwen38-27b-nvfp4-sm121-sglang](https://github.com/r0b0tlab/qwen38-27b-nvfp4-sm121-sglang).
+
+### DeepSeek-V4-Flash-0731 (vLLM + DSpark)
+- **Model:** `deepseek-ai/DeepSeek-V4-Flash-0731` (HF), by DeepSeek.
+- **nvfp4-1m recipe:** port of **[tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark](https://github.com/tonyd2wild/DeepSeek-v4-Flash-0731-DSpark-1M-NVFP4-KV-2x-DGX-Spark)**, pinned to commit `d728faee9f5a8d5ebafe7bc44bca6c5d8d0d192f` (2026-07-31). The recipe reproduces the DSpark overlay + NVFP4 stage patches at container start (fetched from that repo at launch). Author: tonyd2wild, with built-in fixes documented in the recipe header (cold-prefill garble fix, DSpark draft shared-expert loader fix).
+- **b12x recipe:** built on the `ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x` image (spark-arena / eugr nightly build line) with the DSpark B12X backend. The `pre_exec` stop-in-reasoning detokenizer patch is embedded (base64) directly in the recipe.
+
+### DSpark / speculative decoding (DeepSeek)
+- The DSpark speculative-decode stack is developed by NVIDIA engineers / the spark-arena community on top of vLLM; see the upstream repos above and
+  **[NVIDIA DGX Spark forum — DeepSeek V4 Flash threads](https://forums.developer.nvidia.com/)** for tuning notes (RoCE/NCCL, draft acceptance, KV-cache dtype).
+
+---
+
+## Notes
+
+- **API key:** the qwen38 recipes require `QWEN38_API_KEY` at serve time (env var). It is never stored in the repo.
+- **HF models:** DeepSeek-V4-Flash-0731 is ~167 GB and pulled from HF into the sparkrun HF cache (`/cache/huggingface` on Spark nodes); requires `HF_TOKEN` for gated repos if applicable.
+- **Network at launch:** `deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml` fetches its DSpark overlay tarball from GitHub at first container start (digest/commit-pinned). The other three recipes need no runtime fetch.
+- **GPU exclusivity:** the qwen38 SGLang recipes need the GPU to themselves (stop any other job first). tp=2 variants must not overlap with other cluster jobs.

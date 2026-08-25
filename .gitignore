@@ -1,0 +1,13 @@
+# secrets / local runtime state
+api-key
+*.api-key
+.env
+
+# sparkrun / HF caches (never commit)
+.cache/
+sglang-cache/
+*.log
+
+# editor/OS noise
+.DS_Store
+*.swp
