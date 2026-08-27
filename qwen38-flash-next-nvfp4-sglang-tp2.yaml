@@ -1,0 +1,129 @@
+# Qwen3.8-Flash-Next-NVFP4 (RadixArk) - SGLang TP2 across ws01+ws02 (2x DGX Spark / GB10)
+#
+# Serves RadixArk/Qwen3.8-Flash-Next-NVFP4 (~125B-A3B hybrid MoE + 51B n-gram PLE
+# embedding + in-checkpoint 4B MTP head, arch qwen4_exp) with SGLang, tensor-parallel
+# 2 over the existing 2-node CX7 RoCE rail.
+#
+# CONFIG (2026-08-27, updated from latest upstream findings):
+#   Base = tonyd2wild's LOCKED serve config (NVFP4-DGX-Spark repo), updated with the
+#   overnight stability work:
+#     - --mem-fraction-static 0.80 + --max-total-tokens 600000   (GB10 UMA OOM pin;
+#       1.05M pool at 0.82 OOMs under load; 600K pin leaves ~23GB free headroom)
+#     - NEXTN/MTP4 spec decode (3 steps / topk 1 / 4 drafts) + --enable-linear-replayssm-spec
+#     - CUDA graphs ON (--cuda-graph-max-bs 8 + --disable-cuda-graph-padding): speed
+#       default, ~70 tok/s peak on code/structured, ~47 typical. Known day-0 residual:
+#       rare mrope device-assert under graphs -> for a bulletproof production agent
+#       endpoint, drop the two cuda-graph flags (=> ~55 peak, no graph risk).
+#     - --disable-radix-cache (KV pool), --sampling-backend pytorch, explicit
+#       --ple-offload-embedding
+#     - agent-safe: --tool-call-parser qwen3_coder + thinking-off default (sglang#36537).
+#       OPERATIONAL RULE: keep agent temperature <= 0.7.
+#   Vision stays FULL multimodal (no language_model_only).
+#
+# IMAGE: qwen38-flashnext-dspark:local - built from lmsysorg/sglang:qwen38flashnext +
+# MiaAI-Lab's SM121 Triton QSA fallback (graph-safe kernel). Already on ws01 + ws02
+# (identical image ID; sparkrun auto-distributes at run time anyway):
+#   docker pull lmsysorg/sglang:qwen38flashnext                    (done, ws01)
+#   cd ~/spark-arena-recipes/docker/qwen38-flashnext && docker build \
+#     --build-arg BASE_IMAGE=lmsysorg/sglang:qwen38flashnext -t qwen38-flashnext-dspark:local .
+#
+# RUN (from ws01, head/rank 0; ws02 needs no recipe file - sparkrun pushes):
+#   sparkrun run qwen38-flash-next-nvfp4-sglang-tp2.yaml --cluster wc
+#   BEFORE EACH LAUNCH (both nodes, mandatory per upstream): drop the page cache:
+#     sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+#
+# Rails: wc cluster manifest has CX7 subnets 192.168.0.0/24 + 192.168.1.0/24
+# (netplan /etc/netplan/40-cx7.yaml). Primary rail = enp1s0f0np0/rocep1s0f0
+# (192.168.0.50 <-> 192.168.0.49), RoCE GID index 3.
+#
+# YaRN LATER (flag-only, no image rebuild / no re-download): step
+# --context-length 262144 -> 900000 and --chunked-prefill-size 4096 -> 1024
+# (and re-check the 600K/token pin). Only worth it if you feed >262k-token prompts.
+#
+# CREDITS: MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks (SM121 kernel work + tuning),
+# tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark + -Fleet-Deploy (locked config,
+# stability/OOM fixes, agent-safe flags), sgl-project/sglang#36537 (agent loop fix),
+# RadixArk/Qwen3.8-Flash-Next-NVFP4 (weights), NVIDIA DGX Spark forum threads.
+recipe_version: "2"
+model: RadixArk/Qwen3.8-Flash-Next-NVFP4
+runtime: sglang
+builder: eugr
+min_nodes: 2
+max_nodes: 2
+
+container: qwen38-flashnext-dspark:local
+
+metadata:
+  description: >-
+    RadixArk/Qwen3.8-Flash-Next-NVFP4 (qwen4_exp) served by SGLang TP=2 on the
+    2-node cluster (ws01+ws02). Latest upstream config: NEXTN/MTP4 3/1/4 + replay-ssm,
+    CUDA graphs on, radix off, mem 0.80 + 600K-token KV pin (OOM-safe), agent-safe
+    parser/thinking-off, ~70 tok/s peak / ~47 typical. Runs on the MiaAI-patched image.
+  runtime: sglang
+  topology: 2x DGX Spark, TP=2
+  context: 262144 native (YaRN 900000 optional, flag-only)
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  served_model_name: Qwen3.8-Flash-Next-NVFP4
+
+executor_config:
+  shm_size: 32gb
+  network: host
+  ipc: host
+
+env:
+  # weights already local on both nodes (~/.cache/huggingface -> /cache/huggingface)
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  # GB10 kernel arches
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  # NCCL over the existing CX7 RoCE rail (enp1s0f0np0 / rocep1s0f0, GID index 3)
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: "0"
+  NCCL_IB_HCA: rocep1s0f0
+  NCCL_IB_GID_INDEX: "3"
+  NCCL_SOCKET_IFNAME: enp1s0f0np0
+  GLOO_SOCKET_IFNAME: enp1s0f0np0
+  NCCL_MAX_NCHANNELS: "4"
+  NCCL_MIN_NCHANNELS: "4"
+  NCCL_CROSS_NIC: "0"
+  NCCL_IGNORE_CPU_AFFINITY: "1"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+
+command: |-
+  python3 -m sglang.launch_server \
+      --model-path {model} \
+      --served-model-name {served_model_name} \
+      --trust-remote-code \
+      --tp-size {tensor_parallel} \
+      --quantization modelopt_fp4 \
+      --fp4-gemm-backend flashinfer_cutlass \
+      --page-size 64 \
+      --mamba-scheduler-strategy extra_buffer \
+      --mamba-track-interval 64 \
+      --speculative-algorithm NEXTN \
+      --speculative-num-steps 3 \
+      --speculative-eagle-topk 1 \
+      --speculative-num-draft-tokens 4 \
+      --enable-linear-replayssm-spec \
+      --chunked-prefill-size 4096 \
+      --max-running-requests 6 \
+      --context-length 262144 \
+      --max-total-tokens 600000 \
+      --mem-fraction-static 0.80 \
+      --allow-auto-truncate \
+      --reasoning-parser auto \
+      --tool-call-parser qwen3_coder \
+      --default-chat-template-kwargs '{"enable_thinking": false}' \
+      --ple-offload-embedding \
+      --cuda-graph-max-bs 8 \
+      --disable-cuda-graph-padding \
+      --disable-radix-cache \
+      --sampling-backend pytorch \
+      --host {host} --port {port}

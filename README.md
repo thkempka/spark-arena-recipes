@@ -18,6 +18,7 @@ sha256-verified, vendored sources. No files outside this repo are required.
 | [`qwen38-dflash2-sglang-a.yaml`](qwen38-dflash2-sglang-a.yaml) | Qwen3.8-27B NVFP4 | SGLang + DFlash2 (k=8) | 1× DGX Spark, tp=1 | 8000 |
 | [`qwen38-dflash2-sglang-parallel-a.yaml`](qwen38-dflash2-sglang-parallel-a.yaml) | Qwen3.8-27B NVFP4 | SGLang + DFlash2 (k=8) | 2× DGX Spark, tp=2 | 8000 |
 | [`deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml`](deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml) | DeepSeek-V4-Flash-0731 | vLLM + DSpark (k=5) | 2× DGX Spark, tp=2, 1M ctx | 8000 |
+| [`qwen38-flash-next-nvfp4-sglang-tp2.yaml`](qwen38-flash-next-nvfp4-sglang-tp2.yaml) | Qwen3.8-Flash-Next-NVFP4 | SGLang + NEXTN/MTP4 | 2× DGX Spark, tp=2 | 8000 |
 | [`deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml`](deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml) | DeepSeek-V4-Flash-0731 | vLLM B12X + DSpark | 2× DGX Spark, tp=2 | 8000 |
 
 All container images are **digest-pinned** (immutable, reproducible). The two
@@ -69,6 +70,12 @@ sparkrun run deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml --cluster <your-2n
 - **DFlash2 code:** merged upstream in **[sgl-project/sglang PR #35371](https://github.com/sgl-project/sglang/pull/35371)** ("DFlash2: local convolution + candidate selector", 2026-08-19, commit `c14312a66420b75c`), Apache-2.0. The vendored overlay + manifest live in `docker/qwen38-dflash2/`; see [`ATTRIBUTION.md`](docker/qwen38-dflash2/ATTRIBUTION.md) for full provenance of each of the 5 files.
 - **Recipe concept & image build:** **[hasso5703/dgx-spark-qwen38](https://github.com/hasso5703/dgx-spark-qwen38)** — the original qwen38 SGLang + DFlash2 systemd deployment this recipe is ported from (base image, overlay, chat template, api-key handling).
 - **Additional upstream contributors referenced in ATTRIBUTION.md:** [MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark), [r0b0tlab/qwen38-27b-nvfp4-sm121-sglang](https://github.com/r0b0tlab/qwen38-27b-nvfp4-sm121-sglang).
+
+### Qwen3.8-Flash-Next-NVFP4 (SGLang)
+- **Model:** `RadixArk/Qwen3.8-Flash-Next-NVFP4` (HF). ~125B-A3B hybrid MoE + 51B n-gram PLE embedding + in-checkpoint 4B MTP head, arch `qwen4_exp`.
+- **Recipe concept & kernel work:** [MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks) - SM121 Triton QSA fallback, CUDA-graph-safe, memory tuning.
+- **Locked config & stability:** [tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-NVFP4-DGX-Spark) and [tonyd2wild/Qwen3.8-Flash-Next-Fleet-Deploy](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-Fleet-Deploy) - NEXTN/MTP4 flags, GB10 UMA OOM pin (mem 0.80 + 600K-KV), agent-safe defaults, day-0 fixes.
+- **Day-0 agent loop fix:** [sgl-project/sglang#36537](https://github.com/sgl-project/sglang/issues/36537) - thinking-off default + qwen3_coder parser, temp <= 0.7.
 
 ### DeepSeek-V4-Flash-0731 (vLLM + DSpark)
 - **Model:** `deepseek-ai/DeepSeek-V4-Flash-0731` (HF), by DeepSeek.
