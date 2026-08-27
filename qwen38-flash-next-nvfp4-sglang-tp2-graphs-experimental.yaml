@@ -4,22 +4,23 @@
 # embedding + in-checkpoint 4B MTP head, arch qwen4_exp) with SGLang, tensor-parallel
 # 2 over the existing 2-node CX7 RoCE rail.
 #
-# CONFIG (2026-08-27) - BULLETPROOF VARIANT = tony2wild HEAD flags, graphs OFF + radix ON.
-#   Recreates the 2026-08-26 "fast + stable + context cache" day-0 regime, which is also
-#   tonyd2wild's own documented bulletproof fallback (MTP4 graphs-off ~55 peak / ~33 typ).
-#     - --disable-cuda-graph: no graph-captured decode/sampling path. EVERY observed crash
-#       of the 70-class config (4x today, incl. with tony2wild exact flags at 17:52) fired
-#       on 'cuda graph: True' decode batches -> 'probability tensor contains inf/nan'
-#       assert (torch.multinomial on NaN logits). Graphs off removes that whole class.
-#     - radix cache ON (no --disable-radix-cache): context/prefix cache back (agent loops
-#       with repeated prompts get cached-token hits -> faster), and mamba pool auto-sizes
-#       to 97 anyway; we still pin --max-mamba-cache-size 97 explicitly.
-#     - Everything else == tony2wild launch-qwen38fn-sglang-tp2.sh exactly:
-#       mem 0.80 + 600K pin, NEXTN/MTP4 3/1/4 + ReplaySSM, --speculative-attention-mode
-#       decode, --disable-prefill-cuda-graph, --ple-offload-embedding, sampler pytorch,
-#       thinking-off, mrope-patched image (no day-0 mrope assert).
-#
-#     - --sampling-backend pytorch, explicit --ple-offload-embedding
+# CONFIG (2026-08-27, updated from latest upstream findings):
+#   Base = tonyd2wild's LOCKED serve config (NVFP4-DGX-Spark repo), updated with the
+#   overnight stability work:
+#     - --mem-fraction-static 0.80 + --max-total-tokens 600000   (GB10 UMA OOM pin;
+#       1.05M pool at 0.82 OOMs under load; 600K pin leaves ~23GB free headroom)
+#     - NEXTN/MTP4 spec decode (3 steps / topk 1 / 4 drafts) + --enable-linear-replayssm-spec
+#     - CUDA graphs ON (--cuda-graph-max-bs 8 + --disable-cuda-graph-padding): speed
+#       default, ~70 tok/s peak on code/structured, ~47 typical. Prefill graphs off
+#       (--disable-prefill-cuda-graph, GB10 house rule) + --speculative-attention-mode decode.
+#     - mamba/SSM state pool PINNED: --max-mamba-cache-size 97 (with --disable-radix-cache
+#       + extra_buffer the pool auto-shrinks to max_running_requests=6 -> ReplaySSM state
+#       exhaustion -> NaN logits -> 'probability tensor contains inf/nan' CUDA assert ->
+#       SIGQUIT. Fixed upstream by tonyd2wild (INCIDENT-2026-08-27-mrope-and-mamba.md).
+#     - image now also carries the mrope partial-rotary Triton OOB fix (rotary_triton.py
+#       t_mask bound; see docker/qwen38-flashnext/Dockerfile) -> no more day-0 mrope assert.
+#     - --disable-radix-cache (KV pool), --sampling-backend pytorch, explicit
+#       --ple-offload-embedding
 #     - agent-safe: --tool-call-parser qwen3_coder + thinking-off default (sglang#36537).
 #       OPERATIONAL RULE: keep agent temperature <= 0.7.
 #   Vision stays FULL multimodal (no language_model_only).
@@ -60,11 +61,9 @@ container: qwen38-flashnext-dspark:local
 metadata:
   description: >-
     RadixArk/Qwen3.8-Flash-Next-NVFP4 (qwen4_exp) served by SGLang TP=2 on the
-    2-node cluster (ws01+ws02). BULLETPROOF variant (yesterday's stable regime):
-    tony2wild-exact flags minus one -- CUDA graphs OFF + radix/context cache ON.
-    NEXTN/MTP4 3/1/4 + replay-ssm, mem 0.80 + 600K-token KV pin (OOM-safe),
-    max-mamba-cache-size 97, agent-safe parser/thinking-off, ~55 tok/s peak /
-    ~33 typical, no graph-capture NaN-assert class. Runs on the patched image.
+    2-node cluster (ws01+ws02). Latest upstream config: NEXTN/MTP4 3/1/4 + replay-ssm,
+    CUDA graphs on, radix off, mem 0.80 + 600K-token KV pin (OOM-safe), agent-safe
+    parser/thinking-off, ~70 tok/s peak / ~47 typical. Runs on the MiaAI-patched image.
   runtime: sglang
   topology: 2x DGX Spark, TP=2
   context: 262144 native (YaRN 900000 optional, flag-only)
@@ -131,8 +130,10 @@ command: |-
       --tool-call-parser qwen3_coder \
       --default-chat-template-kwargs '{"enable_thinking": false}' \
       --ple-offload-embedding \
-      --disable-cuda-graph \
+      --cuda-graph-max-bs 8 \
+      --disable-cuda-graph-padding \
       --disable-prefill-cuda-graph \
+      --disable-radix-cache \
       --sampling-backend pytorch \
       --enable-metrics \
       --host {host} --port {port}
