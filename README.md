@@ -19,6 +19,7 @@ sha256-verified, vendored sources. No files outside this repo are required.
 | [`qwen38-dflash2-sglang-parallel-a.yaml`](qwen38-dflash2-sglang-parallel-a.yaml) | Qwen3.8-27B NVFP4 | SGLang + DFlash2 (k=8) | 2× DGX Spark, tp=2 | 8000 |
 | [`deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml`](deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml) | DeepSeek-V4-Flash-0731 | vLLM + DSpark (k=5) | 2× DGX Spark, tp=2, 1M ctx | 8000 |
 | [`qwen38-flash-next-nvfp4-sglang-tp2.yaml`](qwen38-flash-next-nvfp4-sglang-tp2.yaml) | Qwen3.8-Flash-Next-NVFP4 | SGLang + NEXTN/MTP4 | 2× DGX Spark, tp=2 | 8000 |
+| [`qwen38-flash-next-nvfp4-sglang-tp2-bulletproof.yaml`](qwen38-flash-next-nvfp4-sglang-tp2-bulletproof.yaml) | Qwen3.8-Flash-Next-NVFP4 | SGLang + NEXTN/MTP4, CUDA graphs off + radix on (yesterday's stable regime, ~55 peak) | 2× DGX Spark, tp=2 | 8000 |
 | [`deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml`](deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml) | DeepSeek-V4-Flash-0731 | vLLM B12X + DSpark | 2× DGX Spark, tp=2 | 8000 |
 
 All container images are **digest-pinned** (immutable, reproducible). The two
