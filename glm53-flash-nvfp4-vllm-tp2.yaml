@@ -118,6 +118,9 @@ executor_config:
   shm_size: 32gb
   network: host
   ipc: host
+  # image ENTRYPOINT is ["vllm","serve"] and would swallow the command
+  # sparkrun appends; clear it so the serve command runs as-is.
+  entrypoint: "" 
 
 env:
   # weights local on both nodes (~/.cache/huggingface -> /cache/huggingface)
