@@ -1,0 +1,187 @@
+# GLM-5.3-Flash NVFP4 - vLLM TP2 across ws01+ws02 (2x DGX Spark / GB10)
+#
+# Serves LibertAIDAI/GLM-5.3-Flash-NVFP4 (zai-org/GLM-5.3-Flash: 320B total / 18B active
+# MoE, arch glm5_next = NoPE sparse-MLA + KDA linear attention, native MTP head,
+# max_position_embeddings 1,048,576) with vLLM, tensor-parallel 2 over the CX7 RoCE rail.
+#
+# CONFIG (2026-08-27) - CHISHIKI37 ARM s3 = the measured decode winner on 2 Sparks.
+#   fp8_e4m3 KV pinned at 4,445,787,956 B + MTP k=3. Independent 4-arm sweep beat the
+#   source recipe's own flagship: 28.29 tok/s vs 25.99 (MTP4), on the same patched image.
+#   Why MTP3 not MTP4: per-position draft acceptance ~[0.83,0.59,0.34,0.18] -- the 4th
+#   draft token pays verification cost and returns almost nothing. tonyd2wild measured the
+#   same shape ([0.74,0.47,0.27,0.15]) and flagged k=3 as a tune; chishiki37 tested it.
+#
+# MEASURED EXPECTATIONS (their fleet; absolute tok/s will differ on ours):
+#   decode  ~28 tok/s single stream (prose 27.7 / code 28.1) | C4 ~17.7/stream | C8 agg 73.4
+#   TTFT    <=0.43 s | KV pool 527,879 tokens @ 262K ctx | boot ~14-18 min
+#   no-MTP baseline reproduces at 14.65-14.75 tok/s (bf16 14.75) -> if you see ~14, MTP is off
+#   prefill: NOT cleanly measured anywhere on TP2 (~716-1150 tok/s inferred). Don't trust it.
+#
+# NON-NEGOTIABLE FLAGS (each one is a wall someone already hit):
+#   --moe-backend marlin      auto-selected FLASHINFER_CUTLASS NvFp4 MoE SILENTLY corrupts
+#                             math on sm_121: boots fine, /health green, output is
+#                             "lockLockLock..." from token one. 97% of params route through
+#                             MoE experts. No error, no crash -- the quiet failure class.
+#   --kv-cache-memory         MUST be pinned verbatim when MTP is on. The draft head adds
+#                             ~5 GB; riding gpu-memory-utilization instead OOMs GB10
+#                             (NV_ERR_NO_MEMORY in dmesg, death on FIRST request, no
+#                             traceback). Larger pins than this also die (ladder study).
+#   --block-size 2304         vLLM's hybrid block aligner must tile by kpool*64 AND the MLA
+#                             128 alignment; DeepGEMM's arch-12 fp8 paged-MQA rejects others.
+#   --enforce-eager           required by the marlin/SM12 path. CUDA graphs are worth only
+#                             +2% here (decode is MoE memory-bandwidth-bound) -- do not
+#                             chase them; chase the drafter instead.
+#   --language-model-only     text-only lane. Without it the multimodal processor balloons
+#                             the API front-end to ~15.7 GB anon RSS at chat-template init
+#                             and the kernel OOM-kills it at any gpu-memory-utilization.
+#                             Drop this ONLY if you actually need image/video input.
+#
+# OPERATING RULES (from tonyd2wild's hard-won list, applies to our fleet too):
+#   * Tear down BOTH ranks before relaunching either. A rank that rendezvouses with a
+#     dying one hangs or dies confusingly.
+#   * Pre-launch ritual on BOTH nodes: sync; echo 3 > /proc/sys/vm/drop_caches
+#     (GB10 unified memory; the NVRM allocator grants KV from MemFree, not MemAvailable).
+#   * Launch WORKER first, wait ~25 s, then head.
+#   * Verify the image tag matches on BOTH nodes before every launch (silent image skew
+#     caused two garbage boots upstream). Copy whole files, never sed over ssh.
+#   * Capture docker logs before docker rm -f. Two unexplained deaths = stop & diagnose.
+#
+# IMAGE: radixark/vllm-glm53-flash:sm121-v8  (LOCAL BUILD - not on any registry)
+#   Built from vllm/vllm-openai:glm53-flash-arm64-cu130 (day-0 image, PR authors; works on
+#   B200, fails 5 ways on GB10) + tonyd2wild's sm121 patch chain. Build order matters; each
+#   layer is FROM the previous tag. v2 is a debug-only NaN-hook build and is SKIPPED:
+#     v1  Dockerfile.glm53-sm121     -> :sm121-nope-mla   (extend SM90 NoPE sparse-MLA to cap 12)
+#     v3  ...-v3                     -> :sm121-fi618      (FlashInfer 0.6.18 nightly: FA2 MLA NaN on 64-256 rows)
+#     v4  ...-v4                     -> :sm121-fi618-nccl (re-pin nvidia-nccl-cu13==2.30.7, nightly downgrades to fabric-fatal 2.29.7)
+#     v5  ...-v5                     -> :sm121-final      (re-pin nvidia-cutlass-dsl==4.6.2, mixed install ICEs CuTeDSL warmup)
+#     v6  ...-v6                     -> :sm121-v6         (gate PDL off on SM12x - unvalidated silicon, KDA state kernels)
+#     v7  ...-v7                     -> :sm121-v7         (indexer top-k dest torch.empty -> init -1 + clamp; NaN lottery)
+#     v8  ...-v8                     -> :sm121-v8         (fp8 KV: cap CTA_TILE_KV instead of forcing 32; smem over-request)
+#   Build script: ~/glm53-build/build_chain.sh   Log: ~/glm53-build.log
+#   Distribute: docker save radixark/vllm-glm53-flash:sm121-v8 | ssh ws02 docker load
+#
+# NOT STABLE / DO NOT USE: --load-format instanttensor (v9). 15x faster loads but all four
+#   of tonyd2wild's v9 TP2 boots lost a rank silently ~1 min after loading. Also re-pins NCCL.
+#
+# ALTERNATIVES NOT USED, for reference:
+#   MiaAI-Lab/GLM-5.3-Flash-NVFP4-Dual-DGX-Spark - Ray TP=2 instead of vLLM mp, port 8888,
+#     multimodal ON, MTP-4, GPU_MEM_UTIL 0.84, KV left unpinned. Publishes no KV token count.
+#     Their single-stream TTFT was 6-8 s (large/cold prompts) vs 0.2-0.3 s elsewhere.
+#   kingjones30/GLM-5.3-Flash-2x-DGX-Spark - fp8_ds_mla + zero-pad-rope shim, claims 738K KV
+#     but ships --max-num-seqs 1 AND no MTP: that pool is bought by giving up the +77% MTP
+#     decode lift, and it is single-user only. Not comparable, so not used.
+#   TP4 (4 Sparks only): 40 tok/s single stream, 5.75M-token KV pool at true 1M context.
+#
+# CREDITS: tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark (patch chain + deploy forensics),
+# chishiki37/glm-5.3-flash-nvfp4-dgx-spark (the MTP3 sweep winner adopted here),
+# MiaAI-Lab/GLM-5.3-Flash-NVFP4-Dual-DGX-Spark, kingjones30, jetnet (forum clock data),
+# LibertAIDAI/GLM-5.3-Flash-NVFP4 (weights), zai-org/GLM-5.3-Flash (model),
+# barrydeen (gmu 0.85 reference), NVIDIA DGX Spark forum threads #381433/#381429/#381534.
+recipe_version: "2"
+model: LibertAIDAI/GLM-5.3-Flash-NVFP4
+runtime: vllm
+min_nodes: 2
+max_nodes: 2
+
+container: radixark/vllm-glm53-flash:sm121-v8
+
+metadata:
+  description: >-
+    LibertAIDAI/GLM-5.3-Flash-NVFP4 (glm5_next, 320B/18B-active, NoPE sparse-MLA + KDA)
+    served by vLLM TP=2 on ws01+ws02. Config = chishiki37 arm s3, the measured 2-Spark
+    decode winner: fp8_e4m3 KV pinned 4.14 GiB + native MTP speculative decoding at k=3
+    (k=3 beats k=4 by +8.8% because draft position 4 accepts only ~0.18). marlin MoE
+    backend is mandatory (the auto NvFp4 backend silently corrupts math on sm_121).
+    ~28 tok/s single-stream expected, KV pool ~528K tokens at 262K context.
+  runtime: vllm
+  topology: 2x DGX Spark, TP=2
+  context: 262144 (model is 1M-native; raise max_model_len only after a long-prefill gate)
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  served_model_name: glm-5.3-flash
+  max_model_len: 262144
+  max_num_seqs: 6
+  gpu_memory_utilization: 0.85
+  kv_cache_dtype: fp8_e4m3
+  # Pin verbatim. Larger or unset dies on GB10 once MTP is resident (see header).
+  kv_cache_memory: 4445787956
+  speculative_config: '{"method":"mtp","num_speculative_tokens":3}'
+  tool_call_parser: glm47
+  reasoning_parser: glm45
+  chat_template_kwargs: '{"enable_thinking": false}'
+  block_size: 2304
+
+executor_config:
+  shm_size: 32gb
+  network: host
+  ipc: host
+
+env:
+  # weights local on both nodes (~/.cache/huggingface -> /cache/huggingface)
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  # GB10 kernel arches
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  # allocator: expandable segments help the GB10 UMA fragmentation class
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  # NCCL over the existing CX7 RoCE rail (enp1s0f0np0 / rocep1s0f0, GID index 3)
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: "0"
+  # Both CX7 chips, not one. Measured 2026-08-27 with nccl-tests all_reduce_perf
+#   (2 ranks, 64M-512M): single HCA 12.8 GB/s vs both 21.1 GB/s = +65%. NCCL stripes
+#   channels across NET/IB/0 and NET/IB/1 (verified in NCCL_DEBUG=INFO output), so
+#   this is real multi-rail aggregation, not a no-op. Each chip is PCIe x4 (~128 Gb/s
+#   theoretical) so one chip genuinely cannot saturate its own 200 Gb port.
+#   Works WITH NCCL_IB_GID_INDEX=3 below (tested: 20.8 GB/s), so no recipe env change
+#   beyond this line is needed. Subnets are separate point-to-point links on both
+#   nodes (192.168.0.0/24 via enp1s0f0np0, 192.168.1.0/24 via enP2p1s0f0np0).
+  NCCL_IB_HCA: rocep1s0f0,roceP2p1s0f0
+  NCCL_IB_GID_INDEX: "3"
+  NCCL_IB_ROCE_VERSION_NUM: "2"
+  NCCL_SOCKET_IFNAME: enp1s0f0np0
+  GLOO_SOCKET_IFNAME: enp1s0f0np0
+  TP_SOCKET_IFNAME: enp1s0f0np0
+  MN_IF_NAME: enp1s0f0np0
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_CROSS_NIC: "0"
+  NCCL_IB_MERGE_NICS: "0"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_IGNORE_CPU_AFFINITY: "1"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+
+# Notes:
+#   * Do NOT add --nnodes / --node-rank / --master-addr / --master-port / --headless /
+#     --distributed-executor-backend here: launch-cluster.sh injects them per node and says
+#     so explicitly in its own usage text. Our DeepSeek recipe follows the same rule.
+#   * `vllm serve` via container PATH (/usr/local/bin/vllm): no /opt/env shim - the radixark image has no /opt/env. Plain `vllm serve`, like tonyd2wild's launcher (ENTRYPOINT vllm serve).
+#   * --kv-cache-memory is the single most load-bearing flag below; see NON-NEGOTIABLES above.
+#   * Thinking is disabled server-side via --default-chat-template-kwargs. Leave it there:
+#     if pi ever sends chat_template_kwargs it overrides this default wholesale.
+command: |
+  vllm serve {model} \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --block-size {block_size} \
+    --moe-backend marlin \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --kv-cache-memory {kv_cache_memory} \
+    --speculative-config '{speculative_config}' \
+    --enforce-eager \
+    --language-model-only \
+    --tool-call-parser {tool_call_parser} \
+    --enable-auto-tool-choice \
+    --reasoning-parser {reasoning_parser} \
+    --default-chat-template-kwargs '{chat_template_kwargs}'
