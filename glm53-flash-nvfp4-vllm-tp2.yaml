@@ -13,7 +13,7 @@
 #
 # MEASURED EXPECTATIONS (their fleet; absolute tok/s will differ on ours):
 #   decode  ~28 tok/s single stream (prose 27.7 / code 28.1) | C4 ~17.7/stream | C8 agg 73.4
-#   TTFT    <=0.43 s | KV pool 527,879 tokens @ 262K ctx | boot ~14-18 min
+#   TTFT    <=0.43 s | KV pool 527,879 tokens (max_model_len 524,288 = 512K) | boot ~14-18 min
 #   no-MTP baseline reproduces at 14.65-14.75 tok/s (bf16 14.75) -> if you see ~14, MTP is off
 #   prefill: NOT cleanly measured anywhere on TP2 (~716-1150 tok/s inferred). Don't trust it.
 #
@@ -92,17 +92,33 @@ metadata:
     decode winner: fp8_e4m3 KV pinned 4.14 GiB + native MTP speculative decoding at k=3
     (k=3 beats k=4 by +8.8% because draft position 4 accepts only ~0.18). marlin MoE
     backend is mandatory (the auto NvFp4 backend silently corrupts math on sm_121).
-    ~28 tok/s single-stream expected, KV pool ~528K tokens at 262K context.
+    ~28 tok/s single-stream expected, KV pool ~528K tokens; max_model_len 524,288
+    (512K = 2x262,144) set 2026-08-28, 3.6K under the pool ceiling.
   runtime: vllm
   topology: 2x DGX Spark, TP=2
-  context: 262144 (model is 1M-native; raise max_model_len only after a long-prefill gate)
+  context: >-
+    524288 (512K = 2x the previous 262,144; raised 2026-08-28, model is 1M-native).
+    Sits 3,591 tokens under the engine KV pool (527,879 @ the 4.14 GiB pin) ->
+    concurrency 1.01x: one full-length request owns the pool, shorter ones share it
+    as before. Long-prefill >262K still ungated (prefill ~716-1150 tok/s inferred).
+    sparkrun panel estimate 568,655 over-counts (latent-only sizing) -- not usable.
 
 defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
   served_model_name: glm-5.3-flash
-  max_model_len: 262144
+  # max_model_len raised 2026-08-28 to 512K = 2x the old 262,144, just under the
+  # engine KV pool ceiling measured in the boot log (/tmp/sparkrun-panel/
+  # glm53-flash-nvfp4-vllm-tp2.log): GPU KV cache size 527,879 tokens @ the 4.14 GiB
+  # pin -> 3,591 tokens headroom, concurrency 1.01x. One full-length request fits;
+  # shorter workloads share the pool exactly as before (KV memory is pinned either
+  # way, nothing is given up). Do NOT go to the raw ceiling 527,879 -- zero headroom
+  # there for MTP transient slots. The sparkrun pre-flight "Max context tokens:
+  # 568,655" over-counts (latent-only sizing); ignore it. Long-prefill (>262K)
+  # remains ungated: prefill ~716-1150 tok/s inferred -> ~8-12 min TTFT for a
+  # 512K-token prompt.
+  max_model_len: 524288
   max_num_seqs: 6
   gpu_memory_utilization: 0.85
   kv_cache_dtype: fp8_e4m3
