@@ -1,0 +1,248 @@
+# GLM-5.3-Flash NVFP4 - vLLM TP2 across ws01+ws02 (2x DGX Spark / GB10)
+#
+# Serves LibertAIDAI/GLM-5.3-Flash-NVFP4 (zai-org/GLM-5.3-Flash: 320B total / 18B active
+# MoE, arch glm5_next = NoPE sparse-MLA + KDA linear attention, native MTP head,
+# max_position_embeddings 1,048,576) with vLLM, tensor-parallel 2 over the CX7 RoCE rail.
+#
+# DFLASH2 VARIANT WITH BAKED SM121 INDEXER FIX  (supersedes glm53-flash-nvfp4-vllm-tp2-dflash2.yaml)
+#
+# WHY THIS IMAGE: ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2 ships the STOCK
+# sparse_attn_indexer_kpool.py (md5 940fcae3). Its decode-time top-k routes to
+# torch.ops._C.persistent_topk whenever select_k in (512,1024,2048) -- GLM-5.3 has
+# index_topk=2048, index_kpool=4 -> select_k=512 -> ALWAYS eligible. Past ~24K context
+# the kernel's CTA grid oversubscribes GB10's 48 SMs (the gate needs >=78) and the
+# FilteredTopK fallback requires 128KB smem vs SM121's 99KB -> RuntimeError ->
+# EngineDeadError (docs/SM121-CRASH-FORENSICS-2026-08-27.md, upstream).
+#
+# The v11-dflash2 image already bakes the v7 indexer init fix and all DFlash2 drafter
+# patches; it is missing ONLY tonyd2wild's persistent_topk gate. We bake it in
+# (radixark/vllm-glm53-flash:sm121-v11-dflash2-indexerfix, patched md5 2173e533) because
+# sparkrun's recipe schema has NO mounts/volumes key -- tonyd2wild's bind-mount
+# (-v $HOME/patches/sparse_attn_indexer_kpool.py:...:ro) cannot be expressed in a YAML.
+#
+# Why bake instead of leaving it out: our pre-fix run (2026-08-28, log
+# /tmp/sparkrun-panel/glm53-flash-nvfp4-vllm-tp2-dflash2.log) DID load DFlash2
+# (DFlash2DraftModel resolved, spec metrics active) but acceptance was poor:
+# mean length ~2.0-3.8 of 8 slots, per-position [0.57,0.29,0.09,0.035,...],
+# engine throughput ~17-25 t/s vs upstream 46.9 warm/code. The indexer gate is the
+# one launcher-level difference vs tonyd2wild; if the persistent_topk path is subtly
+# wrong on SM121 (not just fatal >24K), it degrades target<->drafter agreement before
+# it kills. The other half of the gap is workload+sampling (see CRITICAL MEASUREMENT
+# NOTES at the bottom).
+#
+# CONFIG (2026-08-27) - CHISHIKI37 ARM s3 = the measured decode winner on 2 Sparks.
+#   fp8_e4m3 KV pinned at 4,445,787,956 B + MTP k=3. Independent 4-arm sweep beat the
+#   source recipe's own flagship: 28.29 tok/s vs 25.99 (MTP4), on the same patched image.
+#   Why MTP3 not MTP4: per-position draft acceptance ~[0.83,0.59,0.34,0.18] -- the 4th
+#   draft token pays verification cost and returns almost nothing. tonyd2wild measured the
+#   same shape ([0.74,0.47,0.27,0.15]) and flagged k=3 as a tune; chishiki37 tested it.
+#
+# MEASURED EXPECTATIONS (their fleet; absolute tok/s will differ on ours):
+#   decode  ~28 tok/s single stream (prose 27.7 / code 28.1) | C4 ~17.7/stream | C8 agg 73.4
+#   TTFT    <=0.43 s | KV pool 527,879 tokens (max_model_len 524,288 = 512K) | boot ~14-18 min
+#   no-MTP baseline reproduces at 14.65-14.75 tok/s (bf16 14.75) -> if you see ~14, MTP is off
+#   prefill: NOT cleanly measured anywhere on TP2 (~716-1150 tok/s inferred). Don't trust it.
+#
+# DFLASH2 UPSTREAM NUMBERS (their fleet, same harness: probes/bench_c1c6.py, 400-token gen,
+# code/reasoning prompts, unique salt, temp 1.0 / top-p 0.95, WARM engine):
+#   C1 35.1 agg (per-stream 35.1) @ 0.525 accept | C2 41.6 | C3 40.6 | C4 47.5 | C5 56.2 | C6 47.7
+#   Best single-stream warm code prompt: 46.9 tok/s @ 74.1% acceptance (420/567 drafted)
+#   vs MTP-4 flagship 21.8 -> 2.15x. TP2 aggregate peaks at C5; speculation trades compute
+#   for latency, so pure-aggregate serving should drop the drafter.
+#   COLD-start caveat: first requests JIT _prepare_dflash_inputs_kernel/_topk_topp_kernel/
+#   mhc_pre_big_fuse_with_norm_tilelang; a cold C1 reads ~10 tok/s low (36.9 vs 46.9).
+#
+# NON-NEGOTIABLE FLAGS (each one is a wall someone already hit):
+#   --moe-backend marlin      auto-selected FLASHINFER_CUTLASS NvFp4 MoE SILENTLY corrupts
+#                             math on sm_121: boots fine, /health green, output is
+#                             "lockLockLock..." from token one. 97% of params route through
+#                             MoE experts. No error, no crash -- the quiet failure class.
+#   --kv-cache-memory         MUST be pinned verbatim when MTP is on. The draft head adds
+#                             ~5 GB; riding gpu-memory-utilization instead OOMs GB10
+#                             (NV_ERR_NO_MEMORY in dmesg, death on FIRST request, no
+#                             traceback). Larger pins than this also die (ladder study).
+#   --block-size 2304         vLLM's hybrid block aligner must tile by kpool*64 AND the MLA
+#                             128 alignment; DeepGEMM's arch-12 fp8 paged-MQA rejects others.
+#   --enforce-eager            required by the marlin/SM12 path. CUDA graphs are worth only
+#                             +2% here (decode is MoE memory-bandwidth-bound) -- do not
+#                             chase them; chase the drafter instead. ALSO: vllm#53030
+#                             piecewise-graph BatchDescriptor collision silently pins
+#                             acceptance at 1.00 -- keep eager for honest metrics.
+#   --language-model-only     text-only lane. Without it the multimodal processor balloons
+#                             the API front-end to ~15.7 GB anon RSS at chat-template init
+#                             and the kernel OOM-kills it at any gpu-memory-utilization.
+#                             Drop this ONLY if you actually need image/video input.
+#
+# OPERATING RULES (from tonyd2wild's hard-won list, applies to our fleet too):
+#   * Tear down BOTH ranks before relaunching either. A rank that rendezvouses with a
+#     dying one hangs or dies confusingly.
+#   * Pre-launch ritual on BOTH nodes: sync; echo 3 > /proc/sys/vm/drop_caches
+#     (GB10 unified memory; the NVRM allocator grants KV from MemFree, not MemAvailable).
+#   * Launch WORKER first, wait ~25 s, then head.
+#   * Verify the image tag matches on BOTH nodes before every launch (silent image skew
+#     caused two garbage boots upstream). Copy whole files, never sed over ssh.
+#   * Capture docker logs before docker rm -f. Two unexplained deaths = stop & diagnose.
+#   * vm.swappiness=0 + cycle swap before launch (UVM livelock workaround, OPEN-PROBLEMS #4).
+#   * Never probe /v1/models for liveness (200 even with dead engine) -- use /health.
+#
+# CRITICAL MEASUREMENT NOTES (upstream OPEN-PROBLEMS #7, verified in our own log):
+#   * Acceptance is WORKLOAD-bound: 0.70+ on structured/math, ~0.33 freeform prose, same
+#     engine minutes apart. Bench with code/reasoning prompts (harness below) or you are
+#     comparing different workloads.
+#   * temperature:0 is free throughput (+13-21%): vLLM's rejection sampler does exact
+#     top-1 match at temp 0 but a probabilistic ratio test above it, and with greedy
+#     drafting the draft probability is pinned to 1, making T>0 strictly harder.
+#   * Warm the engine before measuring (JIT latency spikes on first requests).
+#   * Bench harness: python3 probes/bench_c1c6.py --url http://<HEAD_IP>:8000
+#     (c1-c6 sweep, scrapes acceptance from /metrics). Acceptance summary:
+#     python3 probes/parse_spec_metrics.py <sparkrun log>
+#
+# IMAGE: radixark/vllm-glm53-flash:sm121-v11-dflash2-indexerfix  (LOCAL BUILD - not on any registry)
+#   Built on ws01: ~/glm53-dflash2-fix/build.sh -> docker save | ssh ws02 docker load.
+#   FROM ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2
+#   + baked docker/sparse_attn_indexer_kpool_sm121.py -> .../vllm/model_executor/layers/
+#     sparse_attn_indexer_kpool.py  (persistent_topk gate: multi_processor_count >= 78)
+#   Build log: ~/glm53-dflash2-fix/build.log
+#
+# NOT STABLE / DO NOT USE: --load-format instanttensor (v9). 15x faster loads but all four
+#   of tonyd2wild's v9 TP2 boots lost a rank silently ~1 min after loading. Also re-pins NCCL.
+#
+# ALTERNATIVES NOT USED, for reference:
+#   MiaAI-Lab/GLM-5.3-Flash-NVFP4-Dual-DGX-Spark - Ray TP=2 instead of vLLM mp, port 8888,
+#     multimodal ON, MTP-4, GPU_MEM_UTIL 0.84, KV left unpinned. Publishes no KV token count.
+#     Their single-stream TTFT was 6-8 s (large/cold prompts) vs 0.2-0.3 s elsewhere.
+#   kingjones30/GLM-5.3-Flash-2x-DGX-Spark - fp8_ds_mla + zero-pad-rope shim, claims 738K KV
+#     but ships --max-num-seqs 1 AND no MTP: that pool is bought by giving up the +77% MTP
+#     decode lift, and it is single-user only. Not comparable, so not used.
+#   TP4 (4 Sparks only): 40 tok/s single stream, 5.75M-token KV pool at true 1M context.
+#
+# CREDITS: tonyd2wild/GLM-5.3-Flash-NVFP4-2x-DGX-Spark (patch chain + deploy forensics),
+# chishiki37/glm-5.3-flash-nvfp4-dgx-spark (the MTP3 sweep winner adopted here),
+# MiaAI-Lab/GLM-5.3-Flash-NVFP4-Dual-DGX-Spark, kingjones30, jetnet (forum clock data),
+# LibertAIDAI/GLM-5.3-Flash-NVFP4 (weights), zai-org/GLM-5.3-Flash (model),
+# barrydeen (gmu 0.85 reference), NVIDIA DGX Spark forum threads #381433/#381429/#381534.
+recipe_version: "2"
+model: LibertAIDAI/GLM-5.3-Flash-NVFP4
+runtime: vllm
+min_nodes: 2
+max_nodes: 2
+
+container: radixark/vllm-glm53-flash:sm121-v11-dflash2-indexerfix
+
+metadata:
+  description: >-
+    DFlash2 variant with the SM121 persistent_topk indexer fix BAKED IN (supersedes
+    -dflash2.yaml, whose image lacks the gate). Same weights + incoai/GLM-5.3-Flash-DFlash2
+    drafter K=7, KV pin 3 GiB, max_model_len 262144. Spec-decode loads and runs on the
+    unfixed image too (DFlash2DraftModel + metrics verified 2026-08-28) but acceptance was
+    ~2-3/8 slots; this run isolates whether the indexer gate moves target<->drafter
+    agreement. Benchmark with probes/bench_c1c6.py on a WARM engine; upstream's 46.9 t/s
+    is code-prompt @ 74.1% acceptance, cold reads ~10 t/s low.
+  runtime: vllm
+  topology: 2x DGX Spark, TP=2
+  context: >-
+    262144 -- upstream-measured DFlash2 configuration; do NOT raise here. The drafter
+    costs ~4.8 GiB KV headroom (3 GiB pin -> pool ~380-390K tokens), so the canonical
+    recipe's 512K max_model_len cannot carry over. Model is 1M-native; revisit only
+    after measuring with the pin removed (upstream profiler-sized pool: 581,040).
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  served_model_name: glm-5.3-flash
+  # 262144 = upstream's measured DFlash2 config. Do not raise: the drafter costs
+  # ~4.8 GiB KV headroom, so the 512K max_model_len from the canonical recipe does
+  # not fit the smaller pool.
+  max_model_len: 262144
+  max_num_seqs: 6
+  gpu_memory_utilization: 0.85
+  kv_cache_dtype: fp8_e4m3
+  # 3 GiB, mirroring tonyd2wild's shipped DFlash2 launcher. NOTE: README headline
+  # says do NOT pin (activation-peak subtraction skipped -> long-prompt OOM risk;
+  # profiler-sized DFlash2 pool = 581,040 tokens). Their launcher still pins 3 GiB,
+  # so we mirror the launcher first; drop the pin if we see activation OOMs.
+  kv_cache_memory: 3221225472
+  # K=7 optimal per upstream (conditional acceptance nearly flat; drafter
+  # block_size 8 caps K at 7 -- do not sweep). Drafter resolves offline from the
+  # HF cache (/cache/huggingface); download to BOTH nodes before first launch.
+  speculative_config: '{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7}'
+  tool_call_parser: glm47
+  reasoning_parser: glm45
+  chat_template_kwargs: '{"enable_thinking": false}'
+  block_size: 2304
+
+executor_config:
+  shm_size: 32gb
+  network: host
+  ipc: host
+  # image ENTRYPOINT is ["vllm","serve"] and would swallow the command
+  # sparkrun appends; clear it so the serve command runs as-is.
+  entrypoint: ""
+
+env:
+  # weights local on both nodes (~/.cache/huggingface -> /cache/huggingface)
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  # GB10 kernel arches
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+  # allocator: expandable segments help the GB10 UMA fragmentation class
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+  # NCCL over the existing CX7 RoCE rail (enp1s0f0np0 / rocep1s0f0, GID index 3)
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: "0"
+  # Both CX7 chips, not one. Measured 2026-08-27 with nccl-tests all_reduce_perf
+  #   (2 ranks, 64M-512M): single HCA 12.8 GB/s vs both 21.1 GB/s = +65%. NCCL stripes
+  #   channels across NET/IB/0 and NET/IB/1 (verified in NCCL_DEBUG=INFO output), so
+  #   this is real multi-rail aggregation, not a no-op. Each chip is PCIe x4 (~128 Gb/s
+  #   theoretical) so one chip genuinely cannot saturate its own 200 Gb port.
+  #   Works WITH NCCL_IB_GID_INDEX=3 below (tested: 20.8 GB/s), so no recipe env change
+  #   beyond this line is needed. Subnets are separate point-to-point links on both
+  #   nodes (192.168.0.0/24 via enp1s0f0np0, 192.168.1.0/24 via enP2p1s0f0np0).
+  NCCL_IB_HCA: rocep1s0f0,roceP2p1s0f0
+  NCCL_IB_GID_INDEX: "3"
+  NCCL_IB_ROCE_VERSION_NUM: "2"
+  NCCL_SOCKET_IFNAME: enp1s0f0np0
+  GLOO_SOCKET_IFNAME: enp1s0f0np0
+  TP_SOCKET_IFNAME: enp1s0f0np0
+  MN_IF_NAME: enp1s0f0np0
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_CROSS_NIC: "0"
+  NCCL_IB_MERGE_NICS: "0"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_IGNORE_CPU_AFFINITY: "1"
+  NCCL_DEBUG: WARN
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: "1"
+
+# Notes:
+#   * Do NOT add --nnodes / --node-rank / --master-addr / --master-port / --headless /
+#     --distributed-executor-backend here: launch-cluster.sh injects them per node and says
+#     so explicitly in its own usage text. Our DeepSeek recipe follows the same rule.
+#   * `vllm serve` via container PATH (/usr/local/bin/vllm): no /opt/env shim - the radixark image has no /opt/env. Plain `vllm serve`, like tonyd2wild's launcher (ENTRYPOINT vllm serve).
+#   * --kv-cache-memory is the single most load-bearing flag below; see NON-NEGOTIABLES above.
+#   * Thinking is disabled server-side via --default-chat-template-kwargs. Leave it there:
+#     if pi ever sends chat_template_kwargs it overrides this default wholesale.
+command: |
+  vllm serve {model} \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --trust-remote-code \
+    --tensor-parallel-size {tensor_parallel} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --block-size {block_size} \
+    --moe-backend marlin \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --kv-cache-memory {kv_cache_memory} \
+    --speculative-config '{speculative_config}' \
+    --enforce-eager \
+    --language-model-only \
+    --tool-call-parser {tool_call_parser} \
+    --enable-auto-tool-choice \
+    --reasoning-parser {reasoning_parser} \
+    --default-chat-template-kwargs '{chat_template_kwargs}'
