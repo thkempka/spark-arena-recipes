@@ -98,48 +98,45 @@ runtime: vllm
 min_nodes: 2
 max_nodes: 2
 
-container: radixark/vllm-glm53-flash:sm121-v8
+container: radixark/vllm-glm53-flash:sm121-v11-dflash2
+#ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2
 
 metadata:
   description: >-
-    RedHatAI/GLM-5.3-Flash-NVFP4 (glm5_next, 320B/18B-active, NoPE sparse-MLA + KDA)
-    served by vLLM TP=2 on ws01+ws02. Config = chishiki37 arm s3, the measured 2-Spark
-    decode winner: fp8_e4m3 KV pinned 4.14 GiB + native MTP speculative decoding at k=3
-    (k=3 beats k=4 by +8.8% because draft position 4 accepts only ~0.18). marlin MoE
-    backend is mandatory (the auto NvFp4 backend silently corrupts math on sm_121).
-    ~28 tok/s single-stream expected, KV pool ~528K tokens; max_model_len 524,288
-    (512K = 2x262,144) set 2026-08-28, 3.6K under the pool ceiling.
+    DRY-RUN DFlash2 variant of the canonical MTP-3 recipe (not yet booted). Same
+    weights (RedHatAI/GLM-5.3-Flash-NVFP4) + incoai/GLM-5.3-Flash-DFlash2 drafter
+    K=7 via HF cache, image ghcr sm121-v11-dflash2, KV pin 3 GiB (mirrors upstream
+    launcher). Expected ~47 tok/s C1 (2.15x their MTP-4; our MTP-3 ~28-30) IF open
+    upstream issue #7 (28-31 tok/s on another 2x GB10 pair) does not apply to us.
   runtime: vllm
   topology: 2x DGX Spark, TP=2
   context: >-
-    524288 (512K = 2x the previous 262,144; raised 2026-08-28, model is 1M-native).
-    Sits 3,591 tokens under the engine KV pool (527,879 @ the 4.14 GiB pin) ->
-    concurrency 1.01x: one full-length request owns the pool, shorter ones share it
-    as before. Long-prefill >262K still ungated (prefill ~716-1150 tok/s inferred).
-    sparkrun panel estimate 568,655 over-counts (latent-only sizing) -- not usable.
+    262144 -- upstream-measured DFlash2 configuration; do NOT raise here. The drafter
+    costs ~4.8 GiB KV headroom (3 GiB pin -> pool ~380-390K tokens), so the canonical
+    recipe's 512K max_model_len cannot carry over. Model is 1M-native; revisit only
+    after measuring with the pin removed (upstream profiler-sized pool: 581,040).
 
 defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
   served_model_name: glm-5.3-flash
-  # max_model_len raised 2026-08-28 to 512K = 2x the old 262,144, just under the
-  # engine KV pool ceiling measured in the boot log (/tmp/sparkrun-panel/
-  # glm53-flash-nvfp4-vllm-tp2.log): GPU KV cache size 527,879 tokens @ the 4.14 GiB
-  # pin -> 3,591 tokens headroom, concurrency 1.01x. One full-length request fits;
-  # shorter workloads share the pool exactly as before (KV memory is pinned either
-  # way, nothing is given up). Do NOT go to the raw ceiling 527,879 -- zero headroom
-  # there for MTP transient slots. The sparkrun pre-flight "Max context tokens:
-  # 568,655" over-counts (latent-only sizing); ignore it. Long-prefill (>262K)
-  # remains ungated: prefill ~716-1150 tok/s inferred -> ~8-12 min TTFT for a
-  # 512K-token prompt.
+  # 262144 = upstream's measured DFlash2 config. Do not raise: the drafter costs
+  # ~4.8 GiB KV headroom, so the 512K max_model_len from the canonical recipe does
+  # not fit the smaller pool.
   max_model_len: 262144
   max_num_seqs: 6
   gpu_memory_utilization: 0.85
   kv_cache_dtype: fp8_e4m3
-  # Pin verbatim. Larger or unset dies on GB10 once MTP is resident (see header).
-  kv_cache_memory: 4445787956
-  speculative_config: '{"method":"mtp","num_speculative_tokens":3}'
+  # 3 GiB, mirroring tonyd2wild's shipped DFlash2 launcher. NOTE: README headline
+  # says do NOT pin (activation-peak subtraction skipped -> long-prompt OOM risk;
+  # profiler-sized DFlash2 pool = 581,040 tokens). Their launcher still pins 3 GiB,
+  # so we mirror the launcher first; drop the pin if we see activation OOMs.
+  kv_cache_memory: 3221225472
+  # K=7 optimal per upstream (conditional acceptance nearly flat; drafter
+  # block_size 8 caps K at 7 -- do not sweep). Drafter resolves offline from the
+  # HF cache (/cache/huggingface); download to BOTH nodes before first launch.
+  speculative_config: '{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7}'
   tool_call_parser: glm47
   reasoning_parser: glm45
   chat_template_kwargs: '{"enable_thinking": false}'
