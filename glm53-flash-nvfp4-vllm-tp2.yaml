@@ -13,8 +13,10 @@
 #   ungated, no flag changes below. Costs: W4A4 instead of W4A16 (activations also 4-bit), so
 #   expect a few points down on hard reasoning -- in exchange for correct output. Loads ~2x
 #   faster (11 large shards vs 120 small). The old weights are deleted from both nodes.
-#   NOT applied here: --language-model-only stays, so the vision chat_template_mm.jinja the
-#   upstream note mentions is irrelevant unless image input is enabled later.
+#   VISION ON 2026-08-30: --language-model-only removed and --chat-template points at the
+#   multimodal chat_template_mm.jinja (saved into the HF cache model dir on both nodes; the
+#   checkpoint ships a text-only template, so image requests 500 without the mm variant --
+#   upstream DEPLOY-REPORT addendum 2026-08-27). Text-only path unchanged.
 
 #
 # CONFIG (2026-08-27) - CHISHIKI37 ARM s3 = the measured decode winner on 2 Sparks.
@@ -44,10 +46,12 @@
 #   --enforce-eager           required by the marlin/SM12 path. CUDA graphs are worth only
 #                             +2% here (decode is MoE memory-bandwidth-bound) -- do not
 #                             chase them; chase the drafter instead.
-#   --language-model-only     text-only lane. Without it the multimodal processor balloons
-#                             the API front-end to ~15.7 GB anon RSS at chat-template init
-#                             and the kernel OOM-kills it at any gpu-memory-utilization.
-#                             Drop this ONLY if you actually need image/video input.
+#   --chat-template          REQUIRED for vision: must point at chat_template_mm.jinja
+#                             (staged below from the HF cache snapshot dir). The checkpoint's
+#                             own template is text-only and image requests 500 with it.
+#   --language-model-only     REMOVED 2026-08-30 (vision on). Keeping it disables the
+#                             multimodal processor entirely; the ~15.7 GB anon-RSS note from
+#                             the text-only era no longer applies at this gpu-memory-utilization.
 #
 # OPERATING RULES (from tonyd2wild's hard-won list, applies to our fleet too):
 #   * Tear down BOTH ranks before relaunching either. A rank that rendezvouses with a
@@ -214,7 +218,7 @@ command: |
     --kv-cache-memory {kv_cache_memory} \
     --speculative-config '{speculative_config}' \
     --enforce-eager \
-    --language-model-only \
+    --chat-template "$(ls /cache/huggingface/hub/models--RedHatAI--GLM-5.3-Flash-NVFP4/snapshots/*/chat_template_mm.jinja 2>/dev/null | head -1)" \
     --tool-call-parser {tool_call_parser} \
     --enable-auto-tool-choice \
     --reasoning-parser {reasoning_parser} \
