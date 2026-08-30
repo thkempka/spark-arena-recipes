@@ -143,7 +143,7 @@ defaults:
   speculative_config: '{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7}'
   tool_call_parser: glm47
   reasoning_parser: glm45
-  chat_template_kwargs: '{"enable_thinking": false}'
+  chat_template_kwargs: '{"enable_thinking": true}'
   block_size: 2304
 
 executor_config:
@@ -197,8 +197,11 @@ env:
 #     so explicitly in its own usage text. Our DeepSeek recipe follows the same rule.
 #   * `vllm serve` via container PATH (/usr/local/bin/vllm): no /opt/env shim - the radixark image has no /opt/env. Plain `vllm serve`, like tonyd2wild's launcher (ENTRYPOINT vllm serve).
 #   * --kv-cache-memory is the single most load-bearing flag below; see NON-NEGOTIABLES above.
-#   * Thinking is disabled server-side via --default-chat-template-kwargs. Leave it there:
-#     if pi ever sends chat_template_kwargs it overrides this default wholesale.
+#   * Thinking is ENABLED server-side via --default-chat-template-kwargs (glm45 parser
+#     splits it into `reasoning`; upstream: thinking-off emits untagged reasoning-prose
+#     into content, which desyncs the tool-call parser -- empty tool args, pi rejects
+#     missing required fields. Ship thinking-on + parser). max_tokens includes reasoning
+#     tokens; pi overrides chat_template_kwargs wholesale if it sends them.
 command: |
   vllm serve {model} \
     --served-model-name {served_model_name} \
