@@ -139,7 +139,10 @@ executor_config:
     # /--master-port/--headless) are appended to the END of the command and
     # arrive as positional args, so they must go through a script, not inline
     # after `wait`.
-    - "/home/tk/glm53-miaai-pure/scripts/glm53-serve.sh:/opt/glm53/glm53-serve.sh:ro"
+    # VERSIONED IN THIS REPO (scripts/glm53-serve.sh) - the only human-authored
+    # recipe file that lives here instead of ~/glm53-miaai-pure. Must be
+    # identical on BOTH nodes (see REVISION 4 sync note).
+    - "/home/tk/spark-arena-recipes/scripts/glm53-serve.sh:/opt/glm53/glm53-serve.sh:ro"
 
 env:
   # byte-matched to the running glm53-exl3-head container (docker inspect)

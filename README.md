@@ -7,7 +7,10 @@ prepared for Spark Arena submission and for anyone with a clean checkout of
 **Goal:** clone this repo (+ `spark-vllm-docker`), run `./setup.sh`, and the
 recipes are runnable. Everything (images, models, overlays) is either
 digest-pinned and pulled from a public registry, or built offline from
-sha256-verified, vendored sources. No files outside this repo are required.
+sha256-verified, vendored sources. No files outside this repo are required —
+with one documented exception: the GLM-5.3-Flash EXL3 recipe additionally
+needs the MiaAI-Lab overlay checkout and warm JIT caches on **both** cluster
+nodes (see its section below).
 
 ---
 
@@ -20,6 +23,7 @@ sha256-verified, vendored sources. No files outside this repo are required.
 | [`deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml`](deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml) | DeepSeek-V4-Flash-0731 | vLLM + DSpark (k=5) | 2× DGX Spark, tp=2, 1M ctx | 8000 |
 | [`qwen38-flash-next-nvfp4-sglang-tp2.yaml`](qwen38-flash-next-nvfp4-sglang-tp2.yaml) | Qwen3.8-Flash-Next-NVFP4 | SGLang + NEXTN/MTP4 — **CANONICAL, VERIFIED STABLE**: CUDA graphs off + radix/context cache on (~55 peak / ~33 typ, 94% cache hit) | 2× DGX Spark, tp=2 | 8000 |
 | [`deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml`](deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml) | DeepSeek-V4-Flash-0731 | vLLM B12X + DSpark | 2× DGX Spark, tp=2 | 8000 |
+| [`glm53-flash-exl3-vllm-tp2-dflash2.yaml`](glm53-flash-exl3-vllm-tp2-dflash2.yaml) | GLM-5.3-Flash EXL3 4bpw (320B MoE) | vLLM + DFlash2 (k=7, draft tp=2), CUDA graphs, 1M ctx | 2× DGX Spark, tp=2 | 8000 |
 | [`…-tp2-graphs-experimental.yaml`](qwen38-flash-next-nvfp4-sglang-tp2-graphs-experimental.yaml) | Qwen3.8-Flash-Next-NVFP4 | ⚠️ *experimental, NOT the submission default* — CUDA graphs ON + radix OFF, ~70 peak but NaN-asserts under load | 2× DGX Spark, tp=2 | 8000 |
 
 All container images are **digest-pinned** (immutable, reproducible). The two
@@ -86,6 +90,75 @@ sparkrun run deepseek-v4-flash-0731-dspark-nvfp4-1m-vllm.yaml --cluster <your-2n
 ### DSpark / speculative decoding (DeepSeek)
 - The DSpark speculative-decode stack is developed by NVIDIA engineers / the spark-arena community on top of vLLM; see the upstream repos above and
   **[NVIDIA DGX Spark forum — DeepSeek V4 Flash threads](https://forums.developer.nvidia.com/)** for tuning notes (RoCE/NCCL, draft acceptance, KV-cache dtype).
+
+---
+
+## GLM-5.3-Flash EXL3 4bpw — 2× DGX Spark, TP2 (`glm53-flash-exl3-vllm-tp2-dflash2.yaml`, rev 4)
+
+Serves `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` (320B MoE, EXL3 4bpw) with
+DFlash2 k=7 speculative decoding (draft tp=2), CUDA graphs, 1M context,
+prefix caching, vision on. Reproduces the MiaAI-Lab `start.sh` reference run
+(~49 tok/s peak) as a sparkrun recipe. Status: **validated against the
+miaai-pure baseline; long-generation stability incident root-caused and
+fixed in rev 4.**
+
+### Rev 4 incident summary (why the sync rule exists)
+
+Two independent failure modes, both caused by **state drifting between the
+two cluster nodes**:
+
+1. **Mixed drafter checkpoints.** The DFlash2 drafter was passed as a bare
+   repo id; each node resolved it via its *local* `refs/main` after a silent
+   upstream re-upload of `incoai/GLM-5.3-Flash-DFlash2` (ws01 had the new
+   `bf582e4e`, ws02 the old `7d74cdd8`). The TP-sharded drafter therefore
+   mixed two different weight sets: draft acceptance collapsed to 0 after
+   ~1k generated tokens and output degenerated into token loops.
+   **Fix:** `distribution_config` pins the drafter `revision:` to the
+   validated commit `dc77ff1c` (a sha revision never advances `refs/main`);
+   `refs/main` is pinned on both nodes and the cache is pruned to that single
+   snapshot (weights md5 `065aa1a4…`).
+2. **Trailing newline in `refs/main`.** huggingface_hub 1.28 reads the ref
+   file with `f.read()` and **no `.strip()`** — a newline written by
+   `echo` makes offline repo-id resolution fail (`Invalid repository ID`).
+   Always write refs with `printf '%s' <sha>`, never `echo`.
+
+### Sync rule (MANDATORY for tp=2 across nodes)
+
+Every bind-mounted host file in `executor_config.volumes` is resolved
+**per node** — a stale copy on the worker silently boots a different
+configuration. Before every launch, verify md5 identity across ws01/ws02:
+
+```bash
+# overlay patches + warmup script (9 files)
+for f in patch_glm_video_placeholders.py patch_suppress_stops_in_reasoning.py \
+         patch_scheduler_decode_floor.py patch_glm5_drafter_group.py \
+         patch_hybrid_prefix_hit.py patch_xgrammar_termination.py \
+         patch_kpool_tail_slotmap.py; do
+  md5sum ~/glm53-miaai-pure/overlay/$f
+  ssh tk@ws02 md5sum ~/glm53-miaai-pure/overlay/$f
+done
+md5sum ~/glm53-miaai-pure/scripts/boot-shape-warmup.sh \
+       ~/spark-arena-recipes/scripts/glm53-serve.sh
+ssh tk@ws02 md5sum ~/glm53-miaai-pure/scripts/boot-shape-warmup.sh \
+                   ~/spark-arena-recipes/scripts/glm53-serve.sh
+```
+
+`scripts/glm53-serve.sh` (versioned **in this repo**) additionally fails fast
+at boot if the pinned drafter snapshot is missing on its node, and logs the
+`refs/main` sha it resolved — watch for it diverging between head and worker
+in the logs.
+
+### External dependencies (documented exception to self-containment)
+
+| Host path (both nodes) | Origin | Regenerable? |
+|---|---|---|
+| `~/glm53-miaai-pure/overlay/patch_*.py` (7 files) | MiaAI-Lab repo `GLM-5.3-Flash-EXL3-2x-DGX-Sparks` @ `688b7ab` (tracked) | yes — fresh clone |
+| `~/glm53-miaai-pure/scripts/boot-shape-warmup.sh` | same repo @ `a099743` (tracked) | yes — fresh clone |
+| `~/spark-arena-recipes/scripts/glm53-serve.sh` | **this repo** (versioned) | yes — this checkout |
+| `~/.cache/vllm-glm53-flash/{triton,tilelang}` + root | machine-generated JIT caches from the validated reference run (~95 MB) | no — cold JIT mid-serve on TP=2 has corrupted output; treat as required |
+
+The HF weights (target `024db9f7…`, drafter `dc77ff1c…`) are distributed by
+sparkrun itself and excluded from the table above.
 
 ---
 
