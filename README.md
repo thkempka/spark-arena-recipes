@@ -24,6 +24,8 @@ nodes (see its section below).
 | [`qwen38-flash-next-nvfp4-sglang-tp2.yaml`](qwen38-flash-next-nvfp4-sglang-tp2.yaml) | Qwen3.8-Flash-Next-NVFP4 | SGLang + NEXTN/MTP4 — **CANONICAL, VERIFIED STABLE**: CUDA graphs off + radix/context cache on (~55 peak / ~33 typ, 94% cache hit) | 2× DGX Spark, tp=2 | 8000 |
 | [`deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml`](deepseek-v4-flash-0731-b12x-dspark-vllm-patched.yaml) | DeepSeek-V4-Flash-0731 | vLLM B12X + DSpark | 2× DGX Spark, tp=2 | 8000 |
 | [`glm53-flash-exl3-vllm-tp2-dflash2.yaml`](glm53-flash-exl3-vllm-tp2-dflash2.yaml) | GLM-5.3-Flash EXL3 4bpw (320B MoE) | vLLM + DFlash2 (k=7, draft tp=2), CUDA graphs, 1M ctx | 2× DGX Spark, tp=2 | 8000 |
+| [`glm53-flash-exl3-vllm-tp2-dflash2-conc.yaml`](glm53-flash-exl3-vllm-tp2-dflash2-conc.yaml) | GLM-5.3-Flash EXL3 4bpw (320B MoE) | **CONC variant** — same as stock + `GLM53_MIXED_PREFILL_CHUNK=128`: peer prefills overlap decode (2+ concurrency; decode dips to ~10 tok/s while mixing) | 2× DGX Spark, tp=2 | 8000 |
+| [`glm53-flash-exl3-vllm-tp2-dflash2-ablit.yaml`](glm53-flash-exl3-vllm-tp2-dflash2-ablit.yaml) | GLM-5.3-Flash EXL3 4bpw (320B MoE) | **ABLIT variant** — same as stock + load-time o_proj orthogonalization (dealign, layers 15-45, α=3.0, MTP incl.); serves as `GLM-5.3-Flash-EXL3-Ablit` | 2× DGX Spark, tp=2 | 8000 |
 | [`…-tp2-graphs-experimental.yaml`](qwen38-flash-next-nvfp4-sglang-tp2-graphs-experimental.yaml) | Qwen3.8-Flash-Next-NVFP4 | ⚠️ *experimental, NOT the submission default* — CUDA graphs ON + radix OFF, ~70 peak but NaN-asserts under load | 2× DGX Spark, tp=2 | 8000 |
 
 All container images are **digest-pinned** (immutable, reproducible). The two
@@ -147,6 +149,45 @@ ssh tk@ws02 md5sum ~/glm53-miaai-pure/scripts/boot-shape-warmup.sh \
 at boot if the pinned drafter snapshot is missing on its node, and logs the
 `refs/main` sha it resolved — watch for it diverging between head and worker
 in the logs.
+
+### Concurrency behavior: the decode-floor serializes prefill behind decode
+
+Observed via the Coding Agent Latency Monitor
+(`~/software/2Wild-Coding-Agent-Latency-Monitor/`): launching two parallel
+runs shows `Req running: 1, Req waiting: 1` — the second run's TTFT climbs
+until the first run finishes. This is the recipe's
+`patch_scheduler_decode_floor` working as designed, **not** a monitor or
+vLLM bug (the monitor only displays vLLM's `num_requests_running/waiting`
+metrics), and it matches the MiaAI-Lab reference: their README's live
+occupancy table logs the same signature (`Running: 1`, others wait on
+capacity, then deferred) and their decode bench shows the cost as TTFT
+(719 ms solo vs 6.3–6.6 s at ×2/×4 concurrency) while aggregate throughput
+still scales (62.9 → 103.3 → 146.5 tok/s at ×1/×2/×4).
+
+* The patch (mounted from `~/glm53-miaai-pure/overlay/`) implements the
+  `GLM53_MIXED_PREFILL_CHUNK` policy with default `skip`: **while any
+  request is decoding, the scheduler skips scheduling other requests'
+  prefill chunks** — they wait until no peer is decoding.
+* Why: `max_num_batched_tokens: 2048` is the whole engine step. A decode
+  lane needs ~8 tokens (1 + DFlash2 k=7); if a peer FlashInfer sparse-MLA
+  prefill chunk (~1.5 s) is mixed into that step — i.e. WITHOUT the floor —
+  decode collapses from ~50 tok/s to ~5–10 tok/s on long prefills (issue
+  #6; the sparse-MLA indexer has a large per-step cost, and even a
+  128-token mixed cap stays ~10 tok/s). This collapse is the counterfactual
+  the patch prevents — it is NOT what concurrent decode looks like with the
+  floor active. With `skip` (the bench-table regime), per-stream decode
+  keeps ~52 tok/s at ×2 (the ~11 tok/s vs solo is ordinary batch overhead:
+  2 seqs × 8 tokens per step instead of 8), aggregate still scales
+  (62.9 → 103.3 → 146.5 tok/s at ×1/×2/×4), and the serialization cost
+  surfaces as TTFT (719 ms solo vs 6.3–6.6 s at ×2/×4), not as a
+  decode-rate collapse.
+* Scope: only **prefill vs. decode** is serialized. Once both requests are
+  past prefill they decode together, up to `max_num_seqs: 4`.
+* To allow mixed prefill anyway, set in the recipe `env:`:
+  * `GLM53_MIXED_PREFILL_CHUNK: "128"` — cap mixed prefill chunks
+    (measured ~10 tok/s decode while mixing)
+  * `GLM53_MIXED_PREFILL_CHUNK: "0"` (or `off`) — disable the policy
+    entirely (stock vLLM behavior; decode stalls during peer prefills)
 
 ### External dependencies (documented exception to self-containment)
 

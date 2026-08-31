@@ -30,6 +30,16 @@ python3 /opt/glm53/patch_kpool_tail_slotmap.py || {
     exit 1
 }
 
+# --- 1b. ablit hook installer (only mounted by the ablit recipe) ---
+# Idempotent and inert unless ABLIT=1 (hook no-ops on stock serves), so the
+# stock recipe is unaffected. Same guard as start.sh.
+if [ -f /opt/glm53/patch_ablit.py ]; then
+    python3 /opt/glm53/patch_ablit.py || {
+        echo "glm53-serve: patch_ablit failed" >&2
+        exit 1
+    }
+fi
+
 # --- 2. extract port + served name from args (for health check / warmup) ---
 PORT=8000
 SERVED="GLM-5.3-Flash-EXL3"
@@ -79,6 +89,16 @@ if [ -n "$DRAFT_MODEL" ]; then
             done
             ;;
     esac
+fi
+
+# --- 2c. ablit preflight: fail fast if ABLIT=1 but artifacts are missing on
+# THIS node (TP ranks must apply the identical edit; see sync rule) ---
+if [ "${ABLIT:-0}" = "1" ]; then
+    if [ ! -f /opt/glm53/ablit/LAYER_MAP.json ]; then
+        echo "glm53-serve: FATAL - ABLIT=1 but /opt/glm53/ablit/LAYER_MAP.json missing on this node" >&2
+        exit 1
+    fi
+    echo "glm53-serve: ablit ON method=${ABLIT_METHOD:-auto} direction=${ABLIT_DIRECTION:-dealign} layers=${ABLIT_LAYERS:-15-45} alpha=${ABLIT_ALPHA:-3.0} mtp=${ABLIT_INCLUDE_MTP:-1}"
 fi
 
 # --- 3. launch vllm serve (all args incl. sparkrun-injected distributed flags) ---
