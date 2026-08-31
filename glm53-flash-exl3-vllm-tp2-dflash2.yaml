@@ -1,0 +1,201 @@
+# GLM-5.3-Flash EXL3 4bpw - vLLM TP2 across ws01+ws02 (2x DGX Spark / GB10)
+#
+# REVISION 4 (2026-08-31): pin the DFlash2 drafter to snapshot dc77ff1c - the
+# bare repo id let the two nodes resolve different refs/main after an upstream
+# re-upload, mixing two checkpoints in the TP-sharded drafter (see Weights note
+# below). glm53-serve.sh now fails fast if the pinned snapshot is missing.
+#
+# REVISION 3 (2026-08-30, evening): full reproduction of the miaai-pure start.sh
+# run (~/glm53-miaai-pure, containers glm53-exl3-head/worker), which measured
+# faster and more stable than revision 2 of this recipe (peak ~48.9 tok/s vs
+# ~40 sustained, no tool-call errors, no JIT stalls).
+#
+# WHY REV 2 WAS SLOWER (post-mortem, see /tmp/sparkrun-panel/ vs
+# ~/tmp/spark-panel/glm53-miaai-pure-start-*.log):
+#   * The yaml claimed the overlay patches were 'baked in base' - FALSE. The
+#     base image only carries patch_dflash2/exl3_ext_aarch64/glm_eagle3/
+#     glm_video_placeholders/model_overrides + an OLD patch_glm5_drafter_group.
+#     Rev 2 therefore served WITHOUT xgrammar-termination (#52805), scheduler
+#     decode-floor, hybrid prefix-hit, kpool tail slotmap and
+#     suppress-stops-in-reasoning -> tool-call errors + decode instability.
+#   * Image-only recipes have no mounts -> cold Triton/TileLang JIT caches ->
+#     mid-serving latency spikes (mhc_pre_big_fuse_with_norm_tilelang,
+#     _rejection_kernel, _topk_topp_kernel, _resample_kernel, ...).
+#   * The old drafter patch lacks 'padded slot-share v3': rev 2's 1M boot at
+#     0.87 needed 17.87 GiB KV and DIED; the v3 patch fits 1M into 14.21 GiB
+#     (1,277,777 tokens, 1.28x concurrency).
+#
+# HOW THIS REVISION REPRODUCES THE START.SH RUN:
+#   * container: PURE base image ghcr.io/miaai-lab/...:exl3 (digest ad0cdd86d1dd,
+#     same as the running head) - NOT the stale glm53-flash-exl3-dspark:local.
+#     The GB10 persistent_topk gate is disabled at RUNTIME by the mounted fresh
+#     patch_glm_video_placeholders (_disable_gb10_persistent_topk), so the baked
+#     kpool gate fix is not needed.
+#   * executor_config.volumes (sparkrun >= 0.3.5): mounts the FRESH repo overlay
+#     patches over /opt/glm53/ (same bind-mounts as start.sh) + the warm
+#     Triton/TileLang/vLLM caches. Host paths exist on BOTH nodes (overlay
+#     rsynced to ws02 2026-08-30, md5-verified; caches present on both).
+#   * command: applies the 7 patches in place at boot (exactly what
+#     .glm53-exl3-head.inner.sh does), then serves.
+#   * env: byte-matched to the running container's env (docker inspect),
+#     including SINGLE-HCA NCCL_IB_HCA=rocep1s0f0 - the start.sh schema is
+#     single-HCA per rank and that config is the measured-faster one.
+#   * NO --default-chat-template-kwargs: the pure run omits it and tool calls
+#     work (client controls thinking via chat template kwargs per request).
+#   * max_model_len 1000000: fits at 0.87 WITH the v3 slot-share drafter patch
+#     applied at boot (KV 1,277,777 tokens, 1.28x concurrency). If a future
+#     patch regression inflates KV again, fall back to 524288.
+#
+# Weights: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw snapshot 024db9f7... (local HF
+# cache on both nodes). DFlash2 drafter: repo id + distribution_config revision
+# pinned to dc77ff1c (K=7, draft TP=2). History: passing the bare repo id let
+# each node resolve its own refs/main after a silent upstream re-upload
+# (ws01 bf582e4e vs ws02 7d74cdd8) -> TP-sharded drafter mixed two checkpoints,
+# draft acceptance collapsed to 0 mid-generation, output degenerated into token
+# loops. Pinning the distribution revision + refs/main (dc77ff1c on both nodes,
+# weights md5 065aa1a4...) fixes it. A local snapshot path in
+# speculative_config does NOT work: sparkrun's distributor only accepts repo
+# ids. Do NOT pin TRITON_ATTN for the draft.
+
+recipe_version: "4"
+model: Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw
+runtime: vllm
+min_nodes: 2
+max_nodes: 2
+
+container: ghcr.io/miaai-lab/glm-5.3-flash-2x-dgx-sparks:exl3
+
+metadata:
+  description: >-
+    MiaAI-Lab EXL3 4bpw, pure base image + fresh overlay patches mounted at boot
+    (xgrammar #52805, decode-floor, hybrid prefix-hit, kpool tail slotmap,
+    drafter slot-share v3, suppress-stops), warm JIT caches, DFlash2 K=7 draft
+    TP=2, CUDA graphs, 1M context, prefix caching, vision on. Reproduces the
+    miaai-pure start.sh run as a sparkrun recipe.
+  runtime: vllm
+  topology: 2x DGX Spark, TP=2
+  context: >-
+    1000000 (1M fits at 0.87 with the v3 padded slot-share drafter patch applied
+    at boot; measured KV 1,277,777 tokens, 1.28x concurrency for 1M requests).
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  served_model_name: GLM-5.3-Flash-EXL3
+  max_model_len: 1000000
+  max_num_seqs: 4
+  max_num_batched_tokens: 2048
+  gpu_memory_utilization: 0.87
+  kv_cache_dtype: fp8
+  speculative_config: '{"method":"dflash","model":"incoai/GLM-5.3-Flash-DFlash2","num_speculative_tokens":7,"kv_cache_dtype":"auto","draft_sample_method":"probabilistic","rejection_sample_method":"standard","draft_tensor_parallel_size":2}'
+
+# Pin the DFlash2 drafter distribution to the validated commit. Without this
+# entry sparkrun distributes the drafter at refs/main, which upstream can move
+# (2026-08-31: silent re-upload mixed two checkpoints across the TP ranks).
+# A sha revision downloads exactly dc77ff1c and never advances refs/main; the
+# runtime's auto-added draft entry dedupes against this one by name.
+distribution_config:
+  models:
+    entries:
+      - name: "{model}"
+      - name: incoai/GLM-5.3-Flash-DFlash2
+        revision: dc77ff1c99eeb2df044ee3d4f0094eb033fee410
+
+executor_config:
+  shm_size: 32gb
+  network: host
+  ipc: host
+  # run as container root: the boot patches edit vllm in
+  # /usr/local/lib/python3.12/dist-packages in place, which the default
+  # rootless user (uid mapping of the invoking user) cannot write.
+  # In rootless docker container-root maps to the host user anyway.
+  user: root
+  # base image ENTRYPOINT is ["vllm","serve"] and would swallow the command
+  # sparkrun appends; clear it so the command runs as-is.
+  entrypoint: ""
+  volumes:
+    # fresh repo overlay patches (~/glm53-miaai-pure @ 688b7ab) over the image's
+    # stale /opt/glm53 copies - same bind-mounts start.sh uses. Present on BOTH
+    # nodes (ws02 copy rsynced + md5-verified 2026-08-30).
+    - "/home/tk/glm53-miaai-pure/overlay/patch_glm_video_placeholders.py:/opt/glm53/patch_glm_video_placeholders.py:ro"
+    - "/home/tk/glm53-miaai-pure/overlay/patch_suppress_stops_in_reasoning.py:/opt/glm53/patch_suppress_stops_in_reasoning.py:ro"
+    - "/home/tk/glm53-miaai-pure/overlay/patch_scheduler_decode_floor.py:/opt/glm53/patch_scheduler_decode_floor.py:ro"
+    - "/home/tk/glm53-miaai-pure/overlay/patch_glm5_drafter_group.py:/opt/glm53/patch_glm5_drafter_group.py:ro"
+    - "/home/tk/glm53-miaai-pure/overlay/patch_hybrid_prefix_hit.py:/opt/glm53/patch_hybrid_prefix_hit.py:ro"
+    - "/home/tk/glm53-miaai-pure/overlay/patch_xgrammar_termination.py:/opt/glm53/patch_xgrammar_termination.py:ro"
+    - "/home/tk/glm53-miaai-pure/overlay/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro"
+    # warm JIT caches (exist on both nodes; arch-specific, node-independent)
+    - "/home/tk/.cache/vllm-glm53-flash/triton:/root/.triton/cache"
+    - "/home/tk/.cache/vllm-glm53-flash/tilelang:/root/.tilelang/cache"
+    - "/home/tk/.cache/vllm-glm53-flash:/root/.cache/vllm"
+    # boot-shape warmup script (burns DFlash2 k=7 / sampler / kpool shapes
+    # post-health; without it shape-specialized Triton kernels JIT mid-serve
+    # on TP=2, which corrupted output after some minutes in the rev-3 run)
+    - "/home/tk/glm53-miaai-pure/scripts/boot-shape-warmup.sh:/opt/glm53/boot-shape-warmup.sh:ro"
+    # serve wrapper: applies patches, backgrounds vllm serve, waits for
+    # /health, runs the boot-shape warmup, then keeps the container alive.
+    # sparkrun's injected distributed flags (--nnodes/--node-rank/--master-addr
+    # /--master-port/--headless) are appended to the END of the command and
+    # arrive as positional args, so they must go through a script, not inline
+    # after `wait`.
+    - "/home/tk/glm53-miaai-pure/scripts/glm53-serve.sh:/opt/glm53/glm53-serve.sh:ro"
+
+env:
+  # byte-matched to the running glm53-exl3-head container (docker inspect)
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  EXL3_FUSED_MOE: "1"
+  EXL3_MOE_ROW_TILE: "0"
+  EXL3_TEMP_ROWS_FUSED: "128"
+  NCCL_NET: IB
+  NCCL_NET_PLUGIN: none
+  NCCL_IB_DISABLE: "0"
+  # single HCA - matches the running start.sh config (its GID preflight is
+  # single-HCA per rank); this is the measured-faster configuration.
+  NCCL_IB_HCA: rocep1s0f0
+  NCCL_IB_GID_INDEX: "3"
+  NCCL_IB_ROCE_VERSION_NUM: "2"
+  NCCL_SOCKET_IFNAME: enp1s0f0np0
+  NCCL_CROSS_NIC: "0"
+  NCCL_IB_MERGE_NICS: "0"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_CUMEM_ENABLE: "0"
+  NCCL_IGNORE_CPU_AFFINITY: "1"
+  NCCL_DEBUG: WARN
+
+# Notes:
+#   * Do NOT add --nnodes / --node-rank / --master-addr / --master-port /
+#     --headless / --distributed-executor-backend: launch-cluster.sh injects
+#     them per node.
+#   * No --moe-backend marlin: EXL3 experts run the fused exl3_moe path.
+#   * No --enforce-eager: CUDA graphs on, capture sizes pinned to the DFlash2
+#     verify shapes (1..4 seqs x 8 tokens) exactly as start.sh's EXTRA_ARGS.
+#   * Patches run at boot and edit the container layer in place (writable),
+#     same as the inner.sh scripts; mounted files themselves are :ro.
+#   * ABLIT not wired here (stock o_proj). Use the start.sh flow for ablation
+#     experiments.
+command: |
+  bash /opt/glm53/glm53-serve.sh {model} \
+    --served-model-name {served_model_name} \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --quantization exl3 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --enable-prefix-caching \
+    --no-enable-flashinfer-autotune \
+    --speculative-config '{speculative_config}' \
+    --chat-template /opt/glm53/chat_template.jinja \
+    --limit-mm-per-prompt '{"image":4,"video":1}' \
+    --skip-mm-profiling \
+    --tool-call-parser glm47 \
+    --enable-auto-tool-choice \
+    --reasoning-parser glm45 \
+    --cudagraph-capture-sizes 1 2 4 8 16 24 32
